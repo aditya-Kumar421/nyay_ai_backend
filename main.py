@@ -9,17 +9,11 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from dotenv import load_dotenv   # ← ONLY THIS WAS ADDED TO FIX THE ERROR
+import google.generativeai as genai
 
 
-# ========================
-# LOAD ENVIRONMENT VARIABLES (fixes DATABASE_URL = None)
-# ========================
 load_dotenv()   # Loads .env file if exists, otherwise uses the default below
 
-
-# ========================
-# DATABASE CONFIGURATION
-# ========================
 DATABASE_URL = os.getenv(
     "DATABASE_URL"
 )
@@ -28,6 +22,7 @@ engine = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # ========================
 # SQLALCHEMY MODELS
@@ -325,6 +320,44 @@ def calculate_score(
     reason = " + ".join(reason_parts) if reason_parts else "Basic match"
     return score, reason
 
+def classify_case_type(description: str) -> str:
+    try:
+        model = genai.GenerativeModel("gemini-2.0-flash")
+
+        prompt = f"""
+            You are an expert Indian legal classifier. 
+            Your task is to analyze a legal case description and classify it into **exactly one** of the following three categories based on Indian law:
+                - family
+                - property  
+                - criminal
+
+            ### Classification Rules (Indian Legal Context):
+            - **family**: Any dispute related to marriage, divorce, child custody, maintenance, domestic violence, inheritance within family, adoption, or family relations.
+            - **property**: Any dispute related to land, house, ownership, title, sale/purchase, partition, rent, eviction, or any civil property matter (without any criminal act like murder, assault, cheating, etc.).
+            - **criminal**: Any offence involving crime under Bharatiya Nyaya Sanhita (BNS) / IPC such as murder, assault, theft, fraud, cheating, rape, FIR, police case, or any cognizable offence. Even if there is a property or family background, if a crime has been committed, it is criminal.
+
+            ### Very Important Instructions:
+            - You must return **ONLY ONE WORD** as output: either `family`, `property`, or `criminal`.
+            - Do not write any explanation, reason, sentence, or extra text.
+            - Do not use quotes or any formatting.
+            - If the case has both civil and criminal elements, prioritize **criminal** as it is more serious under Indian law.
+
+            Now classify the following case description:
+
+            Case: {description}
+        """
+
+        response = model.generate_content(prompt)
+        result = response.text.strip().lower()
+       
+        if result not in ["family", "property", "criminal"]:
+            return "family"  # fallback
+
+        return result
+
+    except Exception as e:
+        print("Gemini error:", e)
+        return "family"  # fallback on failure
 
 def update_lawyer_rating(db: Session, lawyer_id: int):
     reviews = db.query(Review).filter(Review.lawyer_id == lawyer_id).all()
@@ -528,6 +561,10 @@ def update_case_status(case_id: int, update: CaseStatusUpdate, db: Session = Dep
 # ========================
 @app.post("/recommend-lawyers", response_model=List[LawyerRecommendation])
 def recommend_lawyers(request: RecommendRequest, db: Session = Depends(get_db)):
+
+    # 🔥 NEW STEP: classify first
+    case_type = classify_case_type(request.description)
+
     lawyer_profiles = db.query(LawyerProfile).all()
     recommendations = []
 
@@ -535,7 +572,15 @@ def recommend_lawyers(request: RecommendRequest, db: Session = Depends(get_db)):
         lawyer_user = db.query(User).filter(User.id == lp.user_id).first()
         if not lawyer_user:
             continue
-        score, reason = calculate_score(lp, request.description, request.budget, request.location)
+
+        # 👇 pass case_type instead of description
+        score, reason = calculate_score(
+            lp,
+            case_type,
+            request.budget,
+            request.location
+        )
+
         rec = LawyerRecommendation(
             id=lp.id,
             lawyer_name=lawyer_user.name,
