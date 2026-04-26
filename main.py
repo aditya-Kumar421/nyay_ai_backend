@@ -9,7 +9,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from dotenv import load_dotenv   # ← ONLY THIS WAS ADDED TO FIX THE ERROR
-import google.generativeai as genai
+import google.genai as genai
 
 
 load_dotenv()   # Loads .env file if exists, otherwise uses the default below
@@ -22,7 +22,6 @@ engine = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # ========================
 # SQLALCHEMY MODELS
@@ -321,37 +320,50 @@ def calculate_score(
     return score, reason
 
 def classify_case_type(description: str) -> str:
+    """
+    Classifies a legal case into exactly one category:
+    'family', 'property', or 'criminal' using Gemini Flash.
+    """
     try:
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        # Initialize the new GenAI client
+        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
         prompt = f"""
-            You are an expert Indian legal classifier. 
-            Your task is to analyze a legal case description and classify it into **exactly one** of the following three categories based on Indian law:
+                You are an expert Indian legal classifier.
+
+                Your task is to analyze a legal case description and classify it into **exactly one** of the following three categories based on Indian law:
+
                 - family
-                - property  
+                - property
                 - criminal
 
-            ### Classification Rules (Indian Legal Context):
-            - **family**: Any dispute related to marriage, divorce, child custody, maintenance, domestic violence, inheritance within family, adoption, or family relations.
-            - **property**: Any dispute related to land, house, ownership, title, sale/purchase, partition, rent, eviction, or any civil property matter (without any criminal act like murder, assault, cheating, etc.).
-            - **criminal**: Any offence involving crime under Bharatiya Nyaya Sanhita (BNS) / IPC such as murder, assault, theft, fraud, cheating, rape, FIR, police case, or any cognizable offence. Even if there is a property or family background, if a crime has been committed, it is criminal.
+                ### Classification Rules (Indian Legal Context):
+                - **family**: Any dispute related to marriage, divorce, child custody, maintenance, domestic violence, inheritance within family, adoption, or family relations.
+                - **property**: Any dispute related to land, house, ownership, title, sale/purchase, partition, rent, eviction, or any civil property matter (without any criminal act like murder, assault, cheating, etc.).
+                - **criminal**: Any offence involving crime under Bharatiya Nyaya Sanhita (BNS) / IPC such as murder, assault, theft, fraud, cheating, rape, FIR, police case, or any cognizable offence. Even if there is a property or family background, if a crime has been committed, it is criminal.
 
-            ### Very Important Instructions:
-            - You must return **ONLY ONE WORD** as output: either `family`, `property`, or `criminal`.
-            - Do not write any explanation, reason, sentence, or extra text.
-            - Do not use quotes or any formatting.
-            - If the case has both civil and criminal elements, prioritize **criminal** as it is more serious under Indian law.
+                ### Very Important Instructions:
+                - You must return **ONLY ONE WORD** as output: either `family`, `property`, or `criminal`.
+                - Do not write any explanation, reason, sentence, or extra text.
+                - Do not use quotes or any formatting.
+                - If the case has both civil and criminal elements, prioritize **criminal** as it is more serious under Indian law.
 
-            Now classify the following case description:
+                Now classify the following case description:
 
-            Case: {description}
-        """
+                Case: {description}
+"""
 
-        response = model.generate_content(prompt)
+        # New way to call Gemini Flash
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt
+        )
+
         result = response.text.strip().lower()
-       
+
+        # Safety fallback
         if result not in ["family", "property", "criminal"]:
-            return "family"  # fallback
+            return "family"
 
         return result
 
