@@ -115,6 +115,7 @@ class Message(Base):
     sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     receiver_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     content = Column(String, nullable=False)
+    purpose = Column(String, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
     is_read = Column(Boolean, default=False)
 
@@ -213,6 +214,7 @@ class RecommendRequest(BaseModel):
 
 
 class LawyerRecommendation(BaseModel):
+    user_id: int
     id: int
     lawyer_name: str
     specialization: str
@@ -224,6 +226,8 @@ class LawyerRecommendation(BaseModel):
     reason: str
     court_of_practice: Optional[str] = None
     bar_council_id: Optional[str] = None
+    
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ReviewCreate(BaseModel):
@@ -250,6 +254,9 @@ class MessageCreate(BaseModel):
     case_id: int
     receiver_id: int
     content: str
+    purpose: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class MessageResponse(BaseModel):
@@ -257,6 +264,32 @@ class MessageResponse(BaseModel):
     sender_name: str
     receiver_name: str
     content: str
+    purpose: Optional[str] = None
+    timestamp: datetime
+    is_read: bool
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ReceiverRequest(BaseModel):
+    receiver_id: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SenderRequest(BaseModel):
+    sender_id: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class MessageFullResponse(BaseModel):
+    id: int
+    case_id: int
+    sender_id: int
+    receiver_id: int
+    content: str
+    purpose: Optional[str] = None
     timestamp: datetime
     is_read: bool
 
@@ -644,6 +677,7 @@ def recommend_lawyers(request: RecommendRequest, db: Session = Depends(get_db)):
 
         rec = LawyerRecommendation(
             id=lp.id,
+            user_id=lawyer_user.id,
             lawyer_name=lawyer_user.name,
             specialization=lp.specialization,
             location=lp.location,
@@ -695,6 +729,7 @@ def search_lawyers(
             continue
         results.append(LawyerRecommendation(
             id=lp.id,
+            user_id=lawyer_user.id,
             lawyer_name=lawyer_user.name,
             specialization=lp.specialization,
             location=lp.location,
@@ -834,7 +869,8 @@ def send_message(message_data: MessageCreate, sender_id: int, db: Session = Depe
         case_id=message_data.case_id,
         sender_id=sender_id,
         receiver_id=message_data.receiver_id,
-        content=message_data.content
+        content=message_data.content,
+        purpose=message_data.purpose
     )
     db.add(new_msg)
     db.commit()
@@ -856,6 +892,46 @@ def get_case_messages(case_id: int, user_id: int, db: Session = Depends(get_db))
             sender_name=sender_name or "Unknown",
             receiver_name=receiver_name or "Unknown",
             content=m.content,
+            purpose=m.purpose,
+            timestamp=m.timestamp,
+            is_read=m.is_read
+        ))
+    return result
+
+
+@app.post("/messages/by-sender", response_model=List[MessageFullResponse])
+def get_messages_by_sender(req: SenderRequest, db: Session = Depends(get_db)):
+    """Return raw message rows where `sender_id` matches the provided value."""
+    messages = db.query(Message).filter(Message.sender_id == req.sender_id).order_by(Message.timestamp).all()
+
+    result: List[MessageFullResponse] = []
+    for m in messages:
+        result.append(MessageFullResponse(
+            id=m.id,
+            case_id=m.case_id,
+            sender_id=m.sender_id,
+            receiver_id=m.receiver_id,
+            content=m.content,
+            purpose=m.purpose,
+            timestamp=m.timestamp,
+            is_read=m.is_read
+        ))
+    return result
+
+
+@app.post("/messages/by-receiver", response_model=List[MessageFullResponse])
+def get_messages_by_receiver(req: ReceiverRequest, db: Session = Depends(get_db)):
+    messages = db.query(Message).filter(Message.receiver_id == req.receiver_id).order_by(Message.timestamp).all()
+
+    result: List[MessageFullResponse] = []
+    for m in messages:
+        result.append(MessageFullResponse(
+            id=m.id,
+            case_id=m.case_id,
+            sender_id=m.sender_id,
+            receiver_id=m.receiver_id,
+            content=m.content,
+            purpose=m.purpose,
             timestamp=m.timestamp,
             is_read=m.is_read
         ))
@@ -891,6 +967,7 @@ def list_all_lawyers(db: Session = Depends(get_db)):
             continue
         results.append(LawyerRecommendation(
             id=lp.id,
+            user_id=lawyer_user.id,
             lawyer_name=lawyer_user.name,
             specialization=lp.specialization,
             location=lp.location,
