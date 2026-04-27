@@ -6,21 +6,23 @@ from sqlalchemy.orm import sessionmaker, Session, relationship
 from pydantic import BaseModel, ConfigDict
 from typing import List, Optional
 import os
-from contextlib import asynccontextmanager
+
 from datetime import datetime
-from dotenv import load_dotenv   # ← ONLY THIS WAS ADDED TO FIX THE ERROR
+from dotenv import load_dotenv 
 import google.genai as genai
 
 
-load_dotenv()   # Loads .env file if exists, otherwise uses the default below
-
+load_dotenv()  
 DATABASE_URL = os.getenv(
     "DATABASE_URL"
 )
-
 engine = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+# Module-level clients/warm connections (set at startup)
+gemini_client = None
+startup_db_conn = None
 
 
 # ========================
@@ -57,6 +59,8 @@ class LawyerProfile(Base):
     fees = Column(Float, nullable=False)
     experience = Column(Integer, nullable=False)
     rating = Column(Float, default=4.5, nullable=False)
+    court_of_practice = Column(String, nullable=True)
+    bar_council_id = Column(String, nullable=True)
 
     user = relationship("User", back_populates="lawyer_profile")
 
@@ -184,6 +188,8 @@ class LawyerProfileBase(BaseModel):
     location: str
     fees: float
     experience: int
+    court_of_practice: Optional[str] = None
+    bar_council_id: Optional[str] = None
 
 
 class LawyerProfileCreate(LawyerProfileBase):
@@ -194,6 +200,8 @@ class LawyerProfileResponse(LawyerProfileBase):
     id: int
     user_id: int
     rating: float
+    court_of_practice: Optional[str] = None
+    bar_council_id: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -214,6 +222,8 @@ class LawyerRecommendation(BaseModel):
     rating: float
     match_score: int
     reason: str
+    court_of_practice: Optional[str] = None
+    bar_council_id: Optional[str] = None
 
 
 class ReviewCreate(BaseModel):
@@ -268,6 +278,8 @@ class BulkLawyerItem(BaseModel):
     location: str
     fees: float
     experience: int
+    court_of_practice: Optional[str] = None
+    bar_council_id: Optional[str] = None
 
 
 
@@ -325,8 +337,11 @@ def classify_case_type(description: str) -> str:
     'family', 'property', or 'criminal' using Gemini Flash.
     """
     try:
-        # Initialize the new GenAI client
-        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        # Reuse a startup-initialized Gemini client when available to avoid per-call init
+        global gemini_client
+        client = gemini_client
+        if client is None:
+            client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
         prompt = f"""
                 You are an expert Indian legal classifier.
@@ -381,13 +396,9 @@ def update_lawyer_rating(db: Session, lawyer_id: int):
             db.commit()
 
 
-# ========================
-# LIFESPAN
-# ========================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    Base.metadata.create_all(bind=engine)
+# Use FastAPI startup/shutdown events to initialize expensive clients and warm DB
 
+def _seed_sample_data_if_needed():
     db = SessionLocal()
     try:
         if db.query(User).count() == 0:
@@ -417,7 +428,8 @@ async def lifespan(app: FastAPI):
             db.commit()
             db.refresh(l1)
             prof1 = LawyerProfile(user_id=l1.id, specialization="family", location="Delhi",
-                                  fees=4500.0, experience=8, rating=4.9)
+                                  fees=4500.0, experience=8, rating=4.9,
+                                  court_of_practice="High Court", bar_council_id="HC-DEL-001")
             db.add(prof1)
 
             l2 = User(name="Meena Patel", email="meena.lawyer@example.com", password="pass123",
@@ -426,7 +438,8 @@ async def lifespan(app: FastAPI):
             db.commit()
             db.refresh(l2)
             prof2 = LawyerProfile(user_id=l2.id, specialization="criminal", location="Mumbai",
-                                  fees=12000.0, experience=12, rating=4.7)
+                                  fees=12000.0, experience=12, rating=4.7,
+                                  court_of_practice="Sessions Court", bar_council_id="SC-MUM-002")
             db.add(prof2)
 
             l3 = User(name="Amit Singh", email="amit.lawyer@example.com", password="pass123",
@@ -435,7 +448,8 @@ async def lifespan(app: FastAPI):
             db.commit()
             db.refresh(l3)
             prof3 = LawyerProfile(user_id=l3.id, specialization="property", location="Delhi",
-                                  fees=6000.0, experience=6, rating=4.5)
+                                  fees=6000.0, experience=6, rating=4.5,
+                                  court_of_practice="District Court", bar_council_id="DC-DEL-003")
             db.add(prof3)
 
             l4 = User(name="Sneha Rao", email="sneha.lawyer@example.com", password="pass123",
@@ -444,7 +458,8 @@ async def lifespan(app: FastAPI):
             db.commit()
             db.refresh(l4)
             prof4 = LawyerProfile(user_id=l4.id, specialization="family", location="Mumbai",
-                                  fees=3500.0, experience=4, rating=4.8)
+                                  fees=3500.0, experience=4, rating=4.8,
+                                  court_of_practice="Subordinate Court", bar_council_id="SUB-MUM-004")
             db.add(prof4)
 
             avail1 = Availability(lawyer_id=l1.id, date="2026-04-28", time_slot="10:00 AM - 11:00 AM")
@@ -464,18 +479,52 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
-    yield
 
-
-# ========================
-# FASTAPI APP
-# ========================
+# Create the FastAPI app (no lifespan manager)
 app = FastAPI(
     title="Nyay AI - Legal Tech Backend",
     description="Complete FastAPI backend with Case Lifecycle, Reviews, Search, Availability & Messaging",
     version="1.1.0",
-    lifespan=lifespan
 )
+
+
+@app.on_event("startup")
+def on_startup():
+    global gemini_client, startup_db_conn
+    # Initialize Gemini client
+    try:
+        gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        print("✅ Gemini client initialized at startup")
+    except Exception as e:
+        gemini_client = None
+        print("⚠️ Failed to initialize Gemini at startup:", e)
+
+    # Warm DB connection and create tables + sample data
+    try:
+        startup_db_conn = engine.connect()
+        print("✅ DB connection opened at startup")
+    except Exception as e:
+        startup_db_conn = None
+        print("⚠️ Failed to open DB connection at startup:", e)
+
+    Base.metadata.create_all(bind=engine)
+    _seed_sample_data_if_needed()
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    global startup_db_conn, gemini_client
+    try:
+        if startup_db_conn is not None:
+            startup_db_conn.close()
+            print("✅ DB startup connection closed")
+    except Exception:
+        pass
+    try:
+        gemini_client = None
+    except Exception:
+        pass
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -603,6 +652,8 @@ def recommend_lawyers(request: RecommendRequest, db: Session = Depends(get_db)):
             rating=lp.rating,
             match_score=score,
             reason=reason
+            ,court_of_practice=lp.court_of_practice,
+            bar_council_id=lp.bar_council_id
         )
         recommendations.append(rec)
 
@@ -652,6 +703,8 @@ def search_lawyers(
             rating=lp.rating,
             match_score=0,
             reason="Filter match"
+            ,court_of_practice=lp.court_of_practice,
+            bar_council_id=lp.bar_council_id
         ))
     return results
 
@@ -677,6 +730,11 @@ def create_profile(profile_data: LawyerProfileCreate, db: Session = Depends(get_
         experience=profile_data.experience,
         rating=4.5
     )
+    # optional fields
+    if getattr(profile_data, "court_of_practice", None):
+        new_profile.court_of_practice = profile_data.court_of_practice
+    if getattr(profile_data, "bar_council_id", None):
+        new_profile.bar_council_id = profile_data.bar_council_id
     db.add(new_profile)
     db.commit()
     db.refresh(new_profile)
@@ -841,6 +899,8 @@ def list_all_lawyers(db: Session = Depends(get_db)):
             rating=lp.rating,
             match_score=0,
             reason="Listed for browsing"
+            ,court_of_practice=lp.court_of_practice,
+            bar_council_id=lp.bar_council_id
         ))
     return results
 
@@ -885,6 +945,10 @@ def bulk_add_lawyers(
             experience=item.experience,
             rating=4.5
         )
+        if getattr(item, "court_of_practice", None):
+            new_profile.court_of_practice = item.court_of_practice
+        if getattr(item, "bar_council_id", None):
+            new_profile.bar_council_id = item.bar_council_id
         db.add(new_profile)
         added_count += 1
 
