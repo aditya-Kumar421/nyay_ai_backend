@@ -4,7 +4,8 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from pydantic import BaseModel, ConfigDict
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+import json
 import os
 
 from datetime import datetime
@@ -130,6 +131,16 @@ class DemoRequest(Base):
     name = Column(String, nullable=False)
     email = Column(String, nullable=False)
     message = Column(String, nullable=False)
+
+
+class KnowYourRightsRequest(Base):
+    __tablename__ = "know_your_rights_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=True)
+    question = Column(String, nullable=False)
+    response = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 # ========================
@@ -321,6 +332,21 @@ class BulkCaseItem(BaseModel):
     description: str
     budget: float
     location: str
+
+
+class KYRRequest(BaseModel):
+    user_id: Optional[int] = None
+    question: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class KYRResponse(BaseModel):
+    legal_rights: str
+    actions: str
+    when_to_hire_lawyer: str
+
+    model_config = ConfigDict(from_attributes=True)
 
 # ========================
 # DATABASE DEPENDENCY
@@ -1084,3 +1110,119 @@ def bulk_add_cases(
 @app.get("/health")
 def health_check():
     return {"status": "healthy", "service": "Nyay AI Backend v1.1"}
+
+
+@app.get("/know-your-rights/user/{user_id}", response_model=List[Dict[str, Any]])
+def get_kyr_by_user(user_id: int, db: Session = Depends(get_db)):
+    """Return a list of KYR request summaries for a given user_id.
+
+    Each item includes the `id`, `question`, and `created_at` timestamp.
+    """
+    items = db.query(KnowYourRightsRequest).filter(
+        KnowYourRightsRequest.user_id == user_id
+    ).order_by(KnowYourRightsRequest.created_at.desc()).all()
+
+    return [
+        {"id": it.id, "question": it.question, "created_at": it.created_at.isoformat() + "Z"}
+        for it in items
+    ]
+
+
+@app.get("/know-your-rights/{kyr_id}", response_model=Dict[str, Any])
+def get_kyr_by_id(kyr_id: int, db: Session = Depends(get_db)):
+    """Return full KYR record by id, including parsed response JSON (if available)."""
+    item = db.query(KnowYourRightsRequest).filter(KnowYourRightsRequest.id == kyr_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="KYR request not found")
+
+    try:
+        parsed = json.loads(item.response)
+    except Exception:
+        parsed = {"raw": item.response}
+
+    return {
+        "id": item.id,
+        "user_id": item.user_id,
+        "question": item.question,
+        "response": parsed,
+        "created_at": item.created_at.isoformat() + "Z"
+    }
+
+
+@app.post("/know-your-rights", response_model=dict)
+def know_your_rights(req: KYRRequest, db: Session = Depends(get_db)):
+    global gemini_client
+    client = gemini_client
+    
+    if client is None:
+        try:
+            client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        except Exception:
+            client = None
+
+    prompt = f"""
+        You are a legal info assistant for Indian laws.
+
+        If the question is NOT related to Indian legal rights, respond with only this:
+        "Sorry, we are not trained to respond to this query in Know Your Rights Mode. This feature is only for general information on legal rights under Indian laws. For your specific situation, please consult a qualified lawyer."
+
+        If it IS related, respond ONLY with this JSON (no extra text or markdown):
+        {{
+        "legal_rights": "40-100 words on relevant rights under Indian law (mention if state-specific).",
+        "actions": "40-100 words on practical steps the user can take.",
+        "when_to_hire_lawyer": "4-5 short sentences on when to consult a lawyer. Always end with: This is general info only, not legal advice."
+        }}
+
+        Question: {req.question}
+    """
+
+    text = None
+    try:
+        if client is not None:
+            response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+    
+            text = (response.text or "").strip()
+            print("Gemini raw response:", repr(text))
+        else:
+            text = "{\"legal_rights\": \"\", \"actions\": \"\", \"when_to_hire_lawyer\": \"\"}"
+    except Exception as e:
+        text = json.dumps({"legal_rights": "", "actions": "", "when_to_hire_lawyer": "", "error": str(e)})
+    
+    # Try to parse JSON out of Gemini's response
+    parsed = None
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        import re
+        m = re.search(r"\{.*\}", text, re.S)
+        if m:
+            try:
+                parsed = json.loads(m.group(0))
+            except Exception:
+                parsed = {"raw": text}
+        else:
+            parsed = {"raw": text}
+
+    # Normalize fields
+    legal_rights = parsed.get("legal_rights") or parsed.get("rights") or parsed.get("legal") or ""
+    actions = parsed.get("actions") or parsed.get("what_to_do") or parsed.get("next_steps") or ""
+    when_to_hire = parsed.get("when_to_hire_lawyer") or parsed.get("when_to_hire") or parsed.get("hire_lawyer_when") or ""
+
+    # Store raw parsed JSON string
+    resp_str = json.dumps(parsed)
+    new = KnowYourRightsRequest(user_id=req.user_id, question=req.question, response=resp_str)
+    db.add(new)
+    db.commit()
+    db.refresh(new)
+
+    return {
+        "id": new.id,
+        "user_id": new.user_id,
+        "question": new.question,
+        "response": {
+            "legal_rights": legal_rights,
+            "actions": actions,
+            "when_to_hire_lawyer": when_to_hire,
+        },
+        "created_at": new.created_at.isoformat() + "Z"
+    }
