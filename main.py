@@ -7,13 +7,14 @@ from pydantic import BaseModel, ConfigDict
 from typing import List, Optional, Dict, Any
 import json
 import os
-
+from huggingface_hub import InferenceClient
+import os
 from datetime import datetime
 from dotenv import load_dotenv 
-import google.genai as genai
+import requests
 
 
-load_dotenv()  
+load_dotenv()
 DATABASE_URL = os.getenv(
     "DATABASE_URL"
 )
@@ -22,8 +23,11 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # Module-level clients/warm connections (set at startup)
-gemini_client = None
 startup_db_conn = None
+
+# Hugging Face models
+CHAT_MODEL = 'meta-llama/Llama-3.1-8B-Instruct'
+EMBEDDING_MODEL = 'sentence-transformers/all-mpnet-base-v2'
 
 
 # ========================
@@ -393,57 +397,61 @@ def calculate_score(
 def classify_case_type(description: str) -> str:
     """
     Classifies a legal case into exactly one category:
-    'family', 'property', or 'criminal' using Gemini Flash.
+    'family', 'property', or 'criminal' using Hugging Face inference.
     """
     try:
-        # Reuse a startup-initialized Gemini client when available to avoid per-call init
-        global gemini_client
-        client = gemini_client
-        if client is None:
-            client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        api_key = os.getenv("HUGGINGFACE_API_KEY")
 
-        prompt = f"""
-                You are an expert Indian legal classifier.
-
-                Your task is to analyze a legal case description and classify it into **exactly one** of the following three categories based on Indian law:
-
-                - family
-                - property
-                - criminal
-
-                ### Classification Rules (Indian Legal Context):
-                - **family**: Any dispute related to marriage, divorce, child custody, maintenance, domestic violence, inheritance within family, adoption, or family relations.
-                - **property**: Any dispute related to land, house, ownership, title, sale/purchase, partition, rent, eviction, or any civil property matter (without any criminal act like murder, assault, cheating, etc.).
-                - **criminal**: Any offence involving crime under Bharatiya Nyaya Sanhita (BNS) / IPC such as murder, assault, theft, fraud, cheating, rape, FIR, police case, or any cognizable offence. Even if there is a property or family background, if a crime has been committed, it is criminal.
-
-                ### Very Important Instructions:
-                - You must return **ONLY ONE WORD** as output: either `family`, `property`, or `criminal`.
-                - Do not write any explanation, reason, sentence, or extra text.
-                - Do not use quotes or any formatting.
-                - If the case has both civil and criminal elements, prioritize **criminal** as it is more serious under Indian law.
-
-                Now classify the following case description:
-
-                Case: {description}
-"""
-
-        # New way to call Gemini Flash
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt
-        )
-
-        result = response.text.strip().lower()
-
-        # Safety fallback
-        if result not in ["family", "property", "criminal"]:
+        if not api_key:
+            desc = description.lower()
+            if any(k in desc for k in ["murder", "assault", "theft", "fir", "police", "rape", "fraud", "cheating"]):
+                return "criminal"
+            if any(k in desc for k in ["marriage", "divorce", "custody", "domestic", "inheritance", "adoption"]):
+                return "family"
+            if any(k in desc for k in ["land", "property", "eviction", "title", "rent", "partition"]):
+                return "property"
             return "family"
 
-        return result
+        client = InferenceClient(token=api_key)
+
+        prompt = f"""
+            You are an expert Indian legal classifier. Choose exactly one word: family, property, or criminal.
+
+            Case: {description}
+            Return only one word: family, property, or criminal.
+            """
+
+        response = client.chat_completion(
+                model="Qwen/Qwen2.5-72B-Instruct",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a case classifier. No explanations."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                max_tokens=900,
+                temperature=0.2,  
+                top_p=0.9
+            )
+
+        result = response.choices[0].message["content"].strip().lower()
+
+        if "criminal" in result:
+            return "criminal"
+        if "property" in result:
+            return "property"
+        if "family" in result:
+            return "family"
+
+        return "family"
 
     except Exception as e:
-        print("Gemini error:", e)
-        return "family"  # fallback on failure
+        print("HF classification error:", e)
+        return "family"
 
 def update_lawyer_rating(db: Session, lawyer_id: int):
     reviews = db.query(Review).filter(Review.lawyer_id == lawyer_id).all()
@@ -549,15 +557,7 @@ app = FastAPI(
 
 @app.on_event("startup")
 def on_startup():
-    global gemini_client, startup_db_conn
-    # Initialize Gemini client
-    try:
-        gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        print("✅ Gemini client initialized at startup")
-    except Exception as e:
-        gemini_client = None
-        print("⚠️ Failed to initialize Gemini at startup:", e)
-
+    global startup_db_conn
     # Warm DB connection and create tables + sample data
     try:
         startup_db_conn = engine.connect()
@@ -572,15 +572,11 @@ def on_startup():
 
 @app.on_event("shutdown")
 def on_shutdown():
-    global startup_db_conn, gemini_client
+    global startup_db_conn
     try:
         if startup_db_conn is not None:
             startup_db_conn.close()
             print("✅ DB startup connection closed")
-    except Exception:
-        pass
-    try:
-        gemini_client = None
     except Exception:
         pass
 
@@ -1151,26 +1147,19 @@ def get_kyr_by_id(kyr_id: int, db: Session = Depends(get_db)):
 
 @app.post("/know-your-rights", response_model=dict)
 def know_your_rights(req: KYRRequest, db: Session = Depends(get_db)):
-    global gemini_client
-    client = gemini_client
-    
-    if client is None:
-        try:
-            client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        except Exception:
-            client = None
+    api_key = os.getenv("HUGGINGFACE_API_KEY")
 
     prompt = f"""
         You are a legal info assistant for Indian laws.
 
         If the question is NOT related to Indian legal rights, respond with only this:
-        "Sorry, we are not trained to respond to this query in Know Your Rights Mode. This feature is only for general information on legal rights under Indian laws. For your specific situation, please consult a qualified lawyer."
+        "Sorry, we are not trained to respond to this query in Know Your Rights Mode."
 
         If it IS related, respond ONLY with this JSON (no extra text or markdown):
         {{
-        "legal_rights": "40-100 words on relevant rights under Indian law (mention if state-specific).",
+        "legal_rights": "40-100 words on relevant rights under Indian law. with citations of articles and sections if possible.",
         "actions": "40-100 words on practical steps the user can take.",
-        "when_to_hire_lawyer": "4-5 short sentences on when to consult a lawyer. Always end with: This is general info only, not legal advice."
+        "when_to_hire_lawyer": "4-5 short sentences on when to consult a lawyer."
         }}
 
         Question: {req.question}
@@ -1178,20 +1167,40 @@ def know_your_rights(req: KYRRequest, db: Session = Depends(get_db)):
 
     text = None
     try:
-        if client is not None:
-            response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
-    
-            text = (response.text or "").strip()
-            print("Gemini raw response:", repr(text))
+        if api_key:
+            client = InferenceClient(token=api_key)
+
+            response = client.chat_completion(
+                model="Qwen/Qwen2.5-72B-Instruct",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a strict JSON generator. Only output valid JSON. No explanations."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                max_tokens=900,
+                temperature=0.2, 
+                top_p=0.9
+            )
+
+            text = response.choices[0].message["content"].strip()
+            if not text.strip().endswith("}"):
+                text += "}"
+            # print("Raw model response:", text)
         else:
             text = "{\"legal_rights\": \"\", \"actions\": \"\", \"when_to_hire_lawyer\": \"\"}"
     except Exception as e:
         text = json.dumps({"legal_rights": "", "actions": "", "when_to_hire_lawyer": "", "error": str(e)})
     
-    # Try to parse JSON out of Gemini's response
+    # Try to parse JSON out of the model's response
     parsed = None
     try:
         parsed = json.loads(text)
+        # print("Parsed model response as JSON:", parsed)
     except Exception:
         import re
         m = re.search(r"\{.*\}", text, re.S)
@@ -1207,7 +1216,7 @@ def know_your_rights(req: KYRRequest, db: Session = Depends(get_db)):
     legal_rights = parsed.get("legal_rights") or parsed.get("rights") or parsed.get("legal") or ""
     actions = parsed.get("actions") or parsed.get("what_to_do") or parsed.get("next_steps") or ""
     when_to_hire = parsed.get("when_to_hire_lawyer") or parsed.get("when_to_hire") or parsed.get("hire_lawyer_when") or ""
-
+    # print("Normalized response:", {"legal_rights": legal_rights, "actions": actions, "when_to_hire_lawyer": when_to_hire})
     # Store raw parsed JSON string
     resp_str = json.dumps(parsed)
     new = KnowYourRightsRequest(user_id=req.user_id, question=req.question, response=resp_str)
